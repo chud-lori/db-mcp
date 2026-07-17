@@ -1,0 +1,46 @@
+# db-mcp connections. Copy to ~/.config/db-mcp/config.toml, fill in
+# READ-ONLY credentials, then: chmod 600 ~/.config/db-mcp/config.toml
+# (the server refuses a config readable by group/others).
+#
+# Shape: [<db-name>.<env>] — env names are yours; 'prod' is special
+# (only reachable via the db_query_prod tool).
+#
+# Use dedicated read-only DB users (grant SQL in the README) — the guard in
+# this server is defense in depth, not the primary control.
+
+[main-db.dev]
+type = "postgres"
+host = "localhost"
+port = 5432
+database = "app"
+user = "db_mcp_ro"
+password = "..."
+
+[main-db.prod]
+type = "postgres"
+host = "prod-host.internal"
+port = 5432
+database = "app"
+user = "db_mcp_ro"
+password = "..."
+
+[legacy.dev]
+type = "mysql"
+host = "localhost"
+port = 3306
+database = "legacy"
+user = "db_mcp_ro"
+password = "..."
+
+[events.dev]
+type = "mongo"
+# Either a full uri, or host/port/database/user/password fields.
+uri = "mongodb://db_mcp_ro:...@localhost:27017/events?authSource=admin"
+database = "events"
+
+[logs.dev]
+type = "es"
+url = "https://localhost:9200"
+username = "db_mcp_ro"
+password = "..."
+# verify_tls = false   # only for self-signed dev clusters
