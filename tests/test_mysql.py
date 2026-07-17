@@ -25,7 +25,7 @@ CFG = {
     "host": "localhost",
     "port": 3306,
     "database": "legacy",
-    "user": "db_mcp_ro",
+    "user": "testuser",
     "password": "x",
 }
 

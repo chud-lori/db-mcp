@@ -5,15 +5,15 @@
 # Shape: [<db-name>.<env>] — env names are yours; 'prod' is special
 # (only reachable via the db_query_prod tool).
 #
-# Use dedicated read-only DB users (grant SQL in the README) — the guard in
-# this server is defense in depth, not the primary control.
+# Use whatever credentials you already have — the server enforces query-only
+# (no DDL/DCL, no writes) regardless of what the account could do.
 
 [main-db.dev]
 type = "postgres"
 host = "localhost"
 port = 5432
 database = "app"
-user = "db_mcp_ro"
+user = "me"
 password = "..."
 
 [main-db.prod]
@@ -21,7 +21,7 @@ type = "postgres"
 host = "prod-host.internal"
 port = 5432
 database = "app"
-user = "db_mcp_ro"
+user = "me"
 password = "..."
 
 [legacy.dev]
@@ -29,18 +29,18 @@ type = "mysql"
 host = "localhost"
 port = 3306
 database = "legacy"
-user = "db_mcp_ro"
+user = "me"
 password = "..."
 
 [events.dev]
 type = "mongo"
 # Either a full uri, or host/port/database/user/password fields.
-uri = "mongodb://db_mcp_ro:...@localhost:27017/events?authSource=admin"
+uri = "mongodb://me:...@localhost:27017/events?authSource=admin"
 database = "events"
 
 [logs.dev]
 type = "es"
 url = "https://localhost:9200"
-username = "db_mcp_ro"
+username = "me"
 password = "..."
 # verify_tls = false   # only for self-signed dev clusters
