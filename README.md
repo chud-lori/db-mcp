@@ -25,6 +25,29 @@ never runs DDL/DCL:
    store supports it (`default_transaction_read_only` on Postgres, `SET
    SESSION TRANSACTION READ ONLY` on MySQL) plus 30s server-side timeouts.
 
+## Failures come back usable
+
+A read-only server still wastes your time if a bad call hangs or a wrong
+guess tells you nothing:
+
+- **Every failure comes back as an answer.** Whatever a driver raises is
+  returned as a tool error against the id of the request that caused it. A
+  reply the caller cannot match to its request is, from its side, the same as
+  no reply at all — the call just never returns.
+- **Nothing runs unbounded.** Server-side caps (`statement_timeout`,
+  `max_execution_time`, `maxTimeMS`) bound *execution*, not a stalled socket
+  or a cursor dripping one batch at a time — each `getMore` restarts the
+  server's clock. Every engine also carries socket timeouts and a 35s
+  client-side deadline, so a runaway call returns an error instead of hanging
+  the session.
+- **A wrong column name comes back with the right ones.** `Unknown column
+  'DATE_CREATE'` tells you the guess was wrong but not what to use, so the
+  next attempt is another guess; SQL engines append the table's real columns
+  (or the database's tables, for an unknown table) to the error.
+- **A mongo timeout on an `{"$oid": …}` filter says so.** Extended JSON is not
+  converted to an `ObjectId` here, so the match scans and finds nothing; the
+  error names the `$toString`/`$expr` rewrite that works.
+
 **Prod is a separate tool.** `db_query` covers non-prod envs (refuses
 `env="prod"`); `db_query_prod` is its own tool name so your harness can
 allowlist dev queries while prod keeps prompting for manual approval.

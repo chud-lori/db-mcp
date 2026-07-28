@@ -9,7 +9,7 @@ from .engines import EngineError, get_engine
 from .guard import ReadOnlyViolation, clamp_limit
 
 PROTOCOL_VERSION = "2025-06-18"
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 _QUERY_PROPS: dict[str, Any] = {
     "db": {"type": "string", "description": "Configured database name (see db_list)"},
@@ -111,11 +111,17 @@ def main() -> int:
     for line in sys.stdin:
         if not line.strip():
             continue
+        request_id = None
         try:
             request = json.loads(line)
+            # Captured before dispatch so a failure is still answerable: a
+            # response the client cannot match to its request is, from the
+            # caller's side, indistinguishable from no response at all.
+            if isinstance(request, dict):
+                request_id = request.get("id")
             response = _handle_request(request)
         except Exception as exc:  # noqa: BLE001 — the server must never die mid-session
-            response = _error(None, -32603, str(exc))
+            response = _error(request_id, -32603, str(exc))
         if response is not None:
             sys.stdout.write(json.dumps(response, separators=(",", ":"), default=str) + "\n")
             sys.stdout.flush()
@@ -171,6 +177,12 @@ def _handle_request(request: dict[str, Any]) -> dict[str, Any] | None:
             result = _handle_tool(name, args)
         except (ConfigError, EngineError, ReadOnlyViolation) as exc:
             result = {"error": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            # Anything a driver raises must still come back as a tool result.
+            # An exception escaping here becomes a protocol-level error, and
+            # the one place that catches those cannot always name the request
+            # it belongs to — leaving the caller waiting on a reply forever.
+            result = {"error": f"{type(exc).__name__}: {exc}"}
         return {
             "jsonrpc": "2.0",
             "id": request_id,

@@ -9,7 +9,7 @@ import unittest
 from decimal import Decimal
 from unittest import mock
 
-from db_mcp.engines import EngineError, postgres
+from db_mcp.engines import QUERY_TIMEOUT_S, EngineError, postgres
 from db_mcp.guard import ReadOnlyViolation
 
 CFG = {
@@ -163,6 +163,72 @@ class PostgresEngineTests(unittest.TestCase):
             postgres.schema(CFG, "billing.invoices")
         _, args = conn.executed[-1]
         self.assertEqual(args, ("billing", "invoices"))
+
+    def test_socket_timeout_covers_the_query_not_just_the_connect(self):
+        # pg8000 hands `timeout` to socket.create_connection and never resets
+        # it, so it bounds every later read too — it must sit above the 30s
+        # statement_timeout rather than cutting legitimate queries short.
+        _, _, mod = self.run_query("SELECT 1")
+        self.assertEqual(mod.connect.call_args.kwargs["timeout"], QUERY_TIMEOUT_S)
+
+
+class FailingCursor(FakeCursor):
+    """Fails the caller's SELECT; information_schema lookups still work."""
+
+    def execute(self, sql, args=None):
+        if "information_schema" not in sql and sql.lstrip().upper().startswith("SELECT"):
+            self._conn.executed.append((sql, args))
+            raise RuntimeError('column "date_create" does not exist')
+        super().execute(sql, args)
+
+
+class FailingConnection(FakeConnection):
+    def __init__(self, rows=(), description=None):
+        super().__init__(rows=rows, description=description)
+        self.rolled_back = False
+
+    def rollback(self):
+        self.rolled_back = True
+
+    def cursor(self):
+        return FailingCursor(self)
+
+
+class PostgresErrorRecoveryTests(unittest.TestCase):
+    """A wrong column must come back with the right ones attached."""
+
+    def run_failing_query(self, sql, rows=(), description=None):
+        conn = FailingConnection(rows=rows, description=description)
+        with mock.patch.dict(sys.modules, {"pg8000": fake_pg8000(conn)}):
+            with self.assertRaises(EngineError) as ctx:
+                postgres.query(CFG, sql, None, 100)
+        return str(ctx.exception), conn
+
+    def test_unknown_column_error_carries_the_real_columns(self):
+        message, conn = self.run_failing_query(
+            "SELECT date_create FROM jobs",
+            rows=[("id",), ("date_created",)],
+            description=[("column_name",)],
+        )
+        self.assertIn('column "date_create" does not exist', message)  # original preserved
+        self.assertIn("columns in jobs: id, date_created", message)
+        self.assertTrue(conn.closed)
+
+    def test_transaction_rolled_back_before_lookup(self):
+        # Without this every information_schema lookup returns "current
+        # transaction is aborted" instead of the column names.
+        _, conn = self.run_failing_query(
+            "SELECT bad FROM jobs", rows=[("id",)], description=[("column_name",)]
+        )
+        self.assertTrue(conn.rolled_back)
+
+    def test_column_lookup_is_parameterized(self):
+        _, conn = self.run_failing_query(
+            "SELECT bad FROM billing.invoices", rows=[("id",)], description=[("column_name",)]
+        )
+        lookups = [(sql, args) for sql, args in conn.executed if "information_schema" in sql]
+        self.assertTrue(lookups)
+        self.assertEqual(lookups[-1][1], ("billing", "invoices"))
 
 
 if __name__ == "__main__":

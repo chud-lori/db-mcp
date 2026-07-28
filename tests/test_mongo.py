@@ -10,7 +10,14 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from db_mcp.engines import EngineError, mongo
+from db_mcp.engines import (
+    CONNECT_TIMEOUT_S,
+    QUERY_TIMEOUT_S,
+    Deadline,
+    EngineError,
+    QueryTimeout,
+    mongo,
+)
 from db_mcp.guard import ReadOnlyViolation
 
 CFG = {"type": "mongo", "uri": "mongodb://ro@localhost:27017/events", "database": "events"}
@@ -252,6 +259,105 @@ class MongoDriverMissingTest(unittest.TestCase):
             with self.assertRaises(EngineError) as ctx:
                 mongo.query(CFG, '{"op": "find"}', "users", 10)
         self.assertIn("pip install pymongo", str(ctx.exception))
+
+
+class NetworkTimeout(Exception):
+    """Stands in for pymongo's timeout family, which we do not import here."""
+
+
+class TimingOutCollection(FakeCollection):
+    def find(self, filter=None, projection=None, max_time_ms=None):
+        raise NetworkTimeout("timed out")
+
+
+def capturing_pymongo(client):
+    """Fake pymongo that records the MongoClient keyword arguments."""
+    module = types.ModuleType("pymongo")
+    module.client_kwargs = {}
+
+    def MongoClient(*args, **kwargs):
+        module.client_kwargs = kwargs
+        return client
+
+    module.MongoClient = MongoClient
+    return module
+
+
+class MongoTimeoutTest(unittest.TestCase):
+    """maxTimeMS bounds one server-side operation; nothing bounded the call."""
+
+    def test_socket_and_connect_timeouts_are_set(self):
+        module = capturing_pymongo(FakeClient(FakeCollection()))
+        with mock.patch.dict(sys.modules, {"pymongo": module}):
+            mongo.query(CFG, '{"op": "find"}', "users", 10)
+        self.assertEqual(module.client_kwargs["socketTimeoutMS"], QUERY_TIMEOUT_S * 1000)
+        self.assertEqual(module.client_kwargs["connectTimeoutMS"], CONNECT_TIMEOUT_S * 1000)
+
+    def test_expired_budget_stops_a_dripping_cursor(self):
+        # Each getMore restarts the server's clock, so a cursor returning one
+        # small batch at a time outlives every server-side cap.
+        client = FakeClient(FakeCollection([{"n": 1}, {"n": 2}]))
+        with mock.patch.dict(sys.modules, {"pymongo": fake_pymongo(client)}):
+            with mock.patch.object(mongo, "Deadline", lambda *a, **k: Deadline(0)):
+                with self.assertRaises(QueryTimeout):
+                    mongo.query(CFG, '{"op": "find"}', "users", 10)
+        self.assertTrue(client.closed)
+
+    def test_driver_timeout_reported_as_query_timeout(self):
+        client = FakeClient(TimingOutCollection())
+        with mock.patch.dict(sys.modules, {"pymongo": fake_pymongo(client)}):
+            with self.assertRaises(QueryTimeout) as ctx:
+                mongo.query(CFG, '{"op": "find", "filter": {"name": "x"}}', "users", 10)
+        self.assertIn("client-side deadline", str(ctx.exception))
+        self.assertNotIn("$toString", str(ctx.exception))  # no $oid in this filter
+
+    def test_oid_filter_timeout_explains_the_workaround(self):
+        # The repeat offender: {"$oid": ...} is never converted to an
+        # ObjectId, so the match scans the collection and finds nothing.
+        client = FakeClient(TimingOutCollection())
+        query = '{"op": "find", "filter": {"package_id": {"$oid": "6a62c70db886846400e21b1e"}}}'
+        with mock.patch.dict(sys.modules, {"pymongo": fake_pymongo(client)}):
+            with self.assertRaises(QueryTimeout) as ctx:
+                mongo.query(CFG, query, "users", 10)
+        message = str(ctx.exception)
+        self.assertIn("$oid", message)
+        self.assertIn("$toString", message)
+
+    def test_oid_rejected_by_the_server_also_explains_the_workaround(self):
+        # The other shape of the same mistake: instead of scanning, the server
+        # rejects it outright with "unknown operator: $oid".
+        class Rejecting(FakeCollection):
+            def find(self, filter=None, projection=None, max_time_ms=None):
+                raise RuntimeError("unknown operator: $oid, full error: {'ok': 0.0}")
+
+        client = FakeClient(Rejecting())
+        query = '{"op": "find", "filter": {"package_id": {"$oid": "6a62c70db886846400e21b1e"}}}'
+        with mock.patch.dict(sys.modules, {"pymongo": fake_pymongo(client)}):
+            with self.assertRaises(EngineError) as ctx:
+                mongo.query(CFG, query, "users", 10)
+        message = str(ctx.exception)
+        self.assertIn("unknown operator: $oid", message)  # original preserved
+        self.assertIn("$toString", message)
+
+    def test_non_timeout_driver_errors_are_not_relabelled(self):
+        class Exploding(FakeCollection):
+            def find(self, filter=None, projection=None, max_time_ms=None):
+                raise RuntimeError("connection reset")
+
+        client = FakeClient(Exploding())
+        with mock.patch.dict(sys.modules, {"pymongo": fake_pymongo(client)}):
+            with self.assertRaises(RuntimeError):
+                mongo.query(CFG, '{"op": "find"}', "users", 10)
+
+
+class OidOperandTest(unittest.TestCase):
+    def test_detected_at_any_depth(self):
+        self.assertTrue(mongo._has_oid_operand({"_id": {"$oid": "abc"}}))
+        self.assertTrue(mongo._has_oid_operand({"pipeline": [{"$match": {"a": {"$oid": "x"}}}]}))
+        self.assertTrue(mongo._has_oid_operand({"_id": {"$in": [{"$oid": "x"}]}}))
+
+    def test_absent_when_no_oid(self):
+        self.assertFalse(mongo._has_oid_operand({"phone": "+65", "n": [1, 2]}))
 
 
 if __name__ == "__main__":

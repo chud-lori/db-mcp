@@ -18,7 +18,7 @@ import json
 import time
 from typing import Any
 
-from . import EngineError
+from . import CONNECT_TIMEOUT_S, QUERY_TIMEOUT_S, Deadline, EngineError, QueryTimeout
 from ..guard import ReadOnlyViolation, clamp_limit
 
 _READ_OPS = ("find", "aggregate", "count", "distinct")
@@ -39,7 +39,12 @@ def _connect(cfg: dict[str, Any]):
     except ImportError:
         raise EngineError("mongo driver missing — pip install pymongo") from None
     kwargs: dict[str, Any] = {
-        "serverSelectionTimeoutMS": 10000,
+        "serverSelectionTimeoutMS": CONNECT_TIMEOUT_S * 1000,
+        "connectTimeoutMS": CONNECT_TIMEOUT_S * 1000,
+        # maxTimeMS bounds one server-side operation, and a cursor's getMore
+        # batches each start that clock over — so it never bounded the call as
+        # a whole. This does, per socket read.
+        "socketTimeoutMS": QUERY_TIMEOUT_S * 1000,
         "readPreference": "secondaryPreferred",
     }
     if cfg.get("uri"):
@@ -108,11 +113,52 @@ def _parse_spec(query: str, target: str | None) -> dict[str, Any]:
     return spec
 
 
+def _has_oid_operand(node: Any) -> bool:
+    """True when the spec matches an ObjectId field via extended JSON."""
+    if isinstance(node, dict):
+        return "$oid" in node or any(_has_oid_operand(v) for v in node.values())
+    if isinstance(node, (list, tuple)):
+        return any(_has_oid_operand(item) for item in node)
+    return False
+
+
+# Extended JSON is not converted here, so {"$oid": ...} reaches the server as
+# a literal document. Depending on where it lands that is either rejected
+# outright ("unknown operator: $oid") or compared against every document and
+# matched by none — the second shape has cost whole sessions.
+_OID_HINT = (
+    '\nThe filter contains {"$oid": ...}, which is not converted to an ObjectId here — it either '
+    "fails as an unknown operator or matches nothing while scanning the collection. Match ObjectId "
+    'fields by string instead: [{"$match": {"$expr": {"$eq": [{"$toString": "$<field>"}, "<24-hex>"]}}}]'
+)
+
+
+def _timeout_error(exc: BaseException, spec: dict[str, Any], deadline: Deadline) -> QueryTimeout:
+    hint = _OID_HINT if _has_oid_operand(spec) else ""
+    return QueryTimeout(
+        f"mongo call exceeded the {deadline.seconds:g}s client-side deadline ({type(exc).__name__}: {exc}) — "
+        "narrow the filter, add a limit, or query an indexed field" + hint
+    )
+
+
 def query(cfg: dict[str, Any], query: str, target: str | None, limit: int) -> dict[str, Any]:
     spec = _parse_spec(query, target)
     limit = clamp_limit(limit)
     op = spec["op"]
     filt = spec.get("filter") or {}
+    deadline = Deadline()
+
+    def collect(cursor) -> list[dict[str, Any]]:
+        """Materialise a cursor, checking the budget between batches.
+
+        Each getMore restarts the server's maxTimeMS, so a cursor that drips
+        one small batch at a time can outlive every server-side cap.
+        """
+        rows = []
+        for doc in cursor:
+            deadline.check(f"mongo {op}")
+            rows.append(_json_safe(doc))
+        return rows
 
     start = time.perf_counter()
     client = _connect(cfg)
@@ -123,11 +169,11 @@ def query(cfg: dict[str, Any], query: str, target: str | None, limit: int) -> di
             sort = spec.get("sort")
             if sort:
                 cursor = cursor.sort([(field, int(direction)) for field, direction in sort])
-            rows = [_json_safe(doc) for doc in cursor.limit(limit)]
+            rows = collect(cursor.limit(limit))
         elif op == "aggregate":
             # Cap output with a final $limit; the pipeline was walked above.
             pipeline = list(spec["pipeline"]) + [{"$limit": limit}]
-            rows = [_json_safe(doc) for doc in coll.aggregate(pipeline, maxTimeMS=_MAX_TIME_MS)]
+            rows = collect(coll.aggregate(pipeline, maxTimeMS=_MAX_TIME_MS))
         elif op == "count":
             rows = [{"count": coll.count_documents(filt, maxTimeMS=_MAX_TIME_MS)}]
         else:  # distinct
@@ -143,6 +189,16 @@ def query(cfg: dict[str, Any], query: str, target: str | None, limit: int) -> di
             "truncated": len(rows) == limit,
             "elapsed_ms": elapsed_ms,
         }
+    except (EngineError, ReadOnlyViolation):
+        raise
+    except Exception as exc:
+        # pymongo reports socketTimeoutMS/maxTimeMS as its own error classes;
+        # report them as one timeout with a recovery hint.
+        if "timeout" in type(exc).__name__.lower() or "timed out" in str(exc).lower():
+            raise _timeout_error(exc, spec, deadline) from None
+        if _has_oid_operand(spec):
+            raise EngineError(f"{exc}{_OID_HINT}") from None
+        raise
     finally:
         client.close()
 

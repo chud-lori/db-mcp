@@ -12,8 +12,8 @@ import time
 from decimal import Decimal
 from typing import Any
 
-from . import EngineError
-from .. import guard
+from . import CONNECT_TIMEOUT_S, QUERY_TIMEOUT_S, EngineError
+from .. import guard, recover
 
 
 def _connect(cfg: dict[str, Any]):
@@ -30,7 +30,12 @@ def _connect(cfg: dict[str, Any]):
         database=cfg.get("database"),
         user=cfg.get("user"),
         password=cfg.get("password"),
-        connect_timeout=10,
+        connect_timeout=CONNECT_TIMEOUT_S,
+        # Socket-level backstop. max_execution_time below is best effort and
+        # silently absent on MariaDB and older MySQL, which left a runaway
+        # SELECT with no cap at all; these always apply.
+        read_timeout=QUERY_TIMEOUT_S,
+        write_timeout=QUERY_TIMEOUT_S,
         cursorclass=pymysql.cursors.DictCursor,
     )
     try:
@@ -45,6 +50,42 @@ def _connect(cfg: dict[str, Any]):
         conn.close()
         raise
     return conn
+
+
+def _column_names(cur, table: str) -> list[str]:
+    """Column names for a table, honouring a "schema.table" qualifier."""
+    schema_name, _, table_name = table.rpartition(".")
+    if schema_name:
+        cur.execute(
+            "SELECT column_name AS name FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
+            (schema_name, table_name),
+        )
+    else:
+        cur.execute(
+            "SELECT column_name AS name FROM information_schema.columns "
+            "WHERE table_schema = DATABASE() AND table_name = %s ORDER BY ordinal_position",
+            (table_name,),
+        )
+    return [row["name"] for row in cur.fetchall()]
+
+
+def _enrich(conn, sql: str, exc: BaseException) -> str:
+    """Driver error plus the real column/table names it should have used."""
+
+    def columns_of(table: str) -> list[str]:
+        with conn.cursor() as cur:
+            return _column_names(cur, table)
+
+    def table_names() -> list[str]:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_name AS name FROM information_schema.tables "
+                "WHERE table_schema = DATABASE() ORDER BY table_name"
+            )
+            return [row["name"] for row in cur.fetchall()]
+
+    return recover.enrich_sql_error(exc, sql, columns_of, table_names)
 
 
 def _json_safe(value: Any) -> Any:
@@ -73,8 +114,13 @@ def query(cfg: dict[str, Any], query: str, target: str | None, limit: int) -> di
     try:
         with conn.cursor() as cur:
             start = time.monotonic()
-            cur.execute(sql)
-            rows = cur.fetchall()
+            try:
+                cur.execute(sql)
+                rows = cur.fetchall()
+            except EngineError:
+                raise
+            except Exception as exc:
+                raise EngineError(_enrich(conn, sql, exc)) from None
             elapsed_ms = int((time.monotonic() - start) * 1000)
     finally:
         conn.close()

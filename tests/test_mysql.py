@@ -18,7 +18,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from db_mcp import guard
-from db_mcp.engines import EngineError, mysql
+from db_mcp.engines import CONNECT_TIMEOUT_S, QUERY_TIMEOUT_S, EngineError, mysql
 
 CFG = {
     "type": "mysql",
@@ -164,6 +164,65 @@ class MySQLEngineTest(unittest.TestCase):
         self.assertIn("information_schema.columns", last_sql)
         self.assertEqual(params, ("users",))
         self.assertNotIn("users", last_sql)  # target passed as a parameter, never inlined
+
+    def test_socket_timeouts_are_set(self):
+        # max_execution_time is silently absent on MariaDB/old MySQL, which
+        # left a runaway SELECT uncapped; these always apply.
+        _, mod = self.run_query("SELECT 1")
+        kwargs = mod.connections[0].kwargs
+        self.assertEqual(kwargs["read_timeout"], QUERY_TIMEOUT_S)
+        self.assertEqual(kwargs["write_timeout"], QUERY_TIMEOUT_S)
+        self.assertEqual(kwargs["connect_timeout"], CONNECT_TIMEOUT_S)
+
+
+class FailingCursor(FakeCursor):
+    """Fails the caller's SELECT; information_schema lookups still work."""
+
+    def execute(self, sql, params=None) -> None:
+        self.conn.executed.append((sql, params))
+        if "information_schema" not in sql and sql.lstrip().upper().startswith("SELECT"):
+            raise RuntimeError("(1054, \"Unknown column 'DATE_CREATE' in 'field list'\")")
+
+
+class FailingConnection(FakeConnection):
+    def cursor(self) -> FailingCursor:
+        return FailingCursor(self)
+
+
+class MySQLErrorRecoveryTest(unittest.TestCase):
+    """A wrong column must come back with the right ones attached."""
+
+    def run_failing_query(self, sql, rows):
+        mod, cursors = make_fake_pymysql()
+        conn_holder = []
+
+        def connect(**kwargs):
+            conn = FailingConnection(list(rows))
+            conn.kwargs = kwargs
+            conn_holder.append(conn)
+            mod.connections.append(conn)
+            return conn
+
+        mod.connect = connect
+        with mock.patch.dict(sys.modules, {"pymysql": mod, "pymysql.cursors": cursors}):
+            with self.assertRaises(EngineError) as ctx:
+                mysql.query(CFG, sql, None, 100)
+        return str(ctx.exception), conn_holder[0]
+
+    def test_unknown_column_error_carries_the_real_columns(self):
+        rows = [{"name": "id"}, {"name": "date_created"}, {"name": "status"}]
+        message, conn = self.run_failing_query("SELECT DATE_CREATE FROM job_tracking", rows)
+        self.assertIn("Unknown column 'DATE_CREATE'", message)  # original preserved
+        self.assertIn("columns in job_tracking: id, date_created, status", message)
+        self.assertTrue(conn.closed)
+
+    def test_column_lookup_is_parameterized(self):
+        _, conn = self.run_failing_query("SELECT bad FROM job_tracking", [{"name": "id"}])
+        lookups = [(sql, params) for sql, params in conn.executed if "information_schema" in sql]
+        self.assertTrue(lookups)
+        sql, params = lookups[-1]
+        self.assertEqual(params, ("job_tracking",))
+        self.assertNotIn("job_tracking", sql)
 
 
 if __name__ == "__main__":

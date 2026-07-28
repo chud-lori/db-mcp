@@ -6,8 +6,8 @@ from decimal import Decimal
 from time import perf_counter
 from typing import Any
 
-from . import EngineError
-from .. import guard
+from . import QUERY_TIMEOUT_S, EngineError
+from .. import guard, recover
 
 # Session-level defense in depth; the SELECT-only DB user in config remains
 # the real enforcement.
@@ -28,8 +28,47 @@ def _connect(cfg: dict[str, Any]):
         database=cfg.get("database"),
         user=cfg.get("user"),
         password=cfg.get("password"),
-        timeout=10,
+        # pg8000 hands this straight to socket.create_connection and never
+        # resets it, so it governs every later read as well as the connect —
+        # it is the query backstop, not just a connect timeout, and must sit
+        # above statement_timeout so the server reports its own error first.
+        timeout=QUERY_TIMEOUT_S,
     )
+
+
+def _column_names(cur, table: str) -> list[str]:
+    """Column names for a table, honouring a "schema.table" qualifier."""
+    schema_name, _, table_name = table.rpartition(".")
+    cur.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
+        (schema_name or "public", table_name),
+    )
+    return [row[0] for row in cur.fetchall()]
+
+
+def _enrich(conn, sql: str, exc: BaseException) -> str:
+    """Driver error plus the real column/table names it should have used."""
+    try:
+        # The failed statement aborted the transaction; without this every
+        # lookup below returns "current transaction is aborted" instead.
+        conn.rollback()
+    except Exception:
+        return str(exc)
+
+    def columns_of(table: str) -> list[str]:
+        return _column_names(conn.cursor(), table)
+
+    def table_names() -> list[str]:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema NOT IN ('pg_catalog', 'information_schema') "
+            "ORDER BY table_name"
+        )
+        return [row[0] for row in cur.fetchall()]
+
+    return recover.enrich_sql_error(exc, sql, columns_of, table_names)
 
 
 def _json_safe(value: Any) -> Any:
@@ -60,8 +99,13 @@ def query(cfg: dict[str, Any], query: str, target: str | None, limit: int) -> di
         for stmt in _SESSION_GUARDS:
             cur.execute(stmt)
         start = perf_counter()
-        cur.execute(sql)
-        raw = cur.fetchall() if cur.description else []
+        try:
+            cur.execute(sql)
+            raw = cur.fetchall() if cur.description else []
+        except EngineError:
+            raise
+        except Exception as exc:
+            raise EngineError(_enrich(conn, sql, exc)) from None
         elapsed_ms = int((perf_counter() - start) * 1000)
         cols = [d[0] for d in cur.description or ()]
         rows = [{c: _json_safe(v) for c, v in zip(cols, r)} for r in raw]
